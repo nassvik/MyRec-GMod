@@ -118,6 +118,7 @@ local NET_CMD   = "MyRec_Cmd"    -- клиент -> сервер (действи
 local NET_SYNC  = "MyRec_Sync"   -- сервер -> клиент (состояние для GUI)
 local NET_TIME  = "MyRec_Time"   -- сервер -> клиент (таймлайн воспроизведения)
 local NET_GHOST = "MyRec_Ghosts" -- сервер -> клиент (призраки прошлых дублей)
+local NET_PROPS = "MyRec_Props" -- сервер -> клиент (список записанных пропов для GUI)
 
 local STATE_IDLE, STATE_REC, STATE_PLAY = 0, 1, 2
 
@@ -128,10 +129,19 @@ local CMD = {
     PLAY_ALL = 9, STOP_ALL = 10,
     SYNC = 11,
     PAUSE = 12, SEEK = 13,
-    SET_NPC_DELAY = 14, RESTORE = 15, -- (4 бита: максимум 15)
+    SET_NPC_DELAY = 14, RESTORE = 15,
+    PROP_MARK = 16,        -- «Выбрать проп на карте» (глазковый трейс)
+    PROP_DEL  = 17,        -- удалить проп из сцены по индексу
+    SAVE      = 18,        -- SaveScene(filename)
+    LOAD      = 19,        -- LoadScene(filename)
+    -- (5 бит: максимум 31)
 }
 
 local MAX_TRACKS, MAX_GROUPS, MAX_BINDINGS = 100, 50, 200
+local MAX_PROPS, MAX_PROP_SAMPLES = 100, 4096   -- лимиты пропов и кадров на проп
+local SCENE_DIR   = "gmod_animator"             -- папка сохранений в game/data/
+local AUTOSAVE    = "autosave.txt"              -- файл автосохранения
+local TICK_SAMPLE = 0.1                         -- шаг сэмплирования движения пропов, сек
 
 -- =====================================================================
 --  СЕРВЕР
@@ -142,6 +152,7 @@ if SERVER then
     util.AddNetworkString(NET_SYNC)
     util.AddNetworkString(NET_TIME)
     util.AddNetworkString(NET_GHOST)
+    util.AddNetworkString(NET_PROPS)
 
     local cv_interval = CreateConVar("my_rec_interval", "0", FCVAR_ARCHIVE,
         "Интервал между кадрами записи (сек). 0 = каждый тик.", 0, 5)
@@ -196,8 +207,14 @@ if SERVER then
 
     local recording = {} -- [ply] = { name, frames, start, nextT, weapon }
     local playbacks = {} -- [ent] = pb
-    local director  = {} -- [ply] = { tracks, groups, nextGroup, bindings }
+    local director  = {} -- [ply] = { tracks, groups, nextGroup, bindings, props }
     local ownerPaused = {} -- [ply] = true, когда режиссёр поставил воспроизведение на паузу
+
+    -- объявлены заранее (используются в раннем коде, определяются ниже)
+    local IsPlaying, SceneTime
+    local SyncPropScene, PausePropScene, SeekPropScene, StopAllProps, MarkSceneDirty
+    local StopPropPlayback -- [propEntry] -> остановить дубль пропа
+    local SaveScene        -- сериализация сцены (NPC + пропы + группы + привязки) в JSON
 
     ------------------------------------------------------------------
     -- Данные «режиссёра» (на каждого игрока свои)
@@ -214,11 +231,18 @@ if SERVER then
                 --   manifest = { class, model, pos, ang, weapon, skin, bodygroups, spawnflags, health },
                 --   played (true после первого запуска сцены: манифест позиции больше не обновляется) }
                 bindings  = {},
+                -- Пропы, добавленные на вкладке «Предметы (Props)»:
+                -- { pid, index (EntIndex), model, skin, pos, ang, delay,
+                --   frames = { {t, x, y, z, p, y, r}, ... }, duration }
+                props     = {},
+                nextPid   = 1,
             }
             director[ply] = d
         end
         return d
     end
+
+    local propPlaybacks = {} -- [propEntry] = активное воспроизведение пропа
 
     local function FindTrack(d, name)
         for _, t in ipairs(d.tracks) do
@@ -255,6 +279,15 @@ if SERVER then
         return name
     end
 
+    -- Имя файла сохранения: только безопасные символы, обязательно .txt
+    local function CleanFileName(s)
+        s = tostring(s or ""):gsub("[^%w_%-%.]", "_")
+        s = s:gsub("%.%.+", "."):gsub("^%.", ""):gsub("_+$", "")
+        if s == "" then return "" end
+        if not s:lower():match("%.txt$") then s = s .. ".txt" end
+        return s:sub(1, 64)
+    end
+
     ------------------------------------------------------------------
     -- Утилиты
     ------------------------------------------------------------------
@@ -271,7 +304,7 @@ if SERVER then
         return true
     end
 
-    local function IsPlaying(ply)
+    IsPlaying = function(ply)
         for _, pb in pairs(playbacks) do
             if pb.owner == ply then return true end
         end
@@ -399,6 +432,21 @@ if SERVER then
                 net.WriteUInt(2, 2) -- end of transfer
             net.Send(ply)
         end)
+    end
+
+    -- Список пропов для таблицы на вкладке «Предметы (Props)»
+    local function SendPropList(ply)
+        if not IsValid(ply) then return end
+        local d = Dir(ply)
+        net.Start(NET_PROPS)
+            net.WriteUInt(#d.props, 8)
+            for _, pr in ipairs(d.props) do
+                net.WriteUInt(pr.pid, 16)
+                net.WriteUInt(pr.index or 0, 16)
+                net.WriteString(pr.model or "")
+                net.WriteUInt(#pr.frames or 0, 16)
+            end
+        net.Send(ply)
     end
 
     local function StopGhostTracks(ply)
@@ -562,6 +610,35 @@ if SERVER then
     end
 
     ------------------------------------------------------------------
+    -- ЗАПИСЬ ПРОПОВ (вкладка «Предметы»)
+    ------------------------------------------------------------------
+    -- Сэмпл текущего состояния пропа в кадр сцены: модель/скин пишутся один раз
+    -- в заголовок пропа, здесь только время, позиция и углы.
+    local function CapturePropFrames(pr, t)
+        local ent = Entity(pr.index or -1)
+        if not IsValid(ent) then return false end
+        local p, a = ent:GetPos(), ent:GetAngles()
+        local f = pr.frames
+        local n = #f
+        -- если проп стоит на месте (и это не первый кадр) — не плодим дубли
+        if n > 0 then
+            local last = f[n]
+            if math.abs(last.x - p.x) < 0.1 and math.abs(last.y - p.y) < 0.1
+                and math.abs(last.z - p.z) < 0.1 and math.abs((last.r or 0) - a.r) < 0.1
+                and math.abs((last.p or 0) - a.p) < 0.1 and math.abs((last.yaw or 0) - a.y) < 0.1
+            then
+                return true
+            end
+        end
+        f[n + 1] = {
+            t = t,
+            x = p.x, y = p.y, z = p.z,
+            p = a.p, yaw = a.y, r = a.r,
+        }
+        return true
+    end
+
+    ------------------------------------------------------------------
     -- ЗАПИСЬ
     ------------------------------------------------------------------
     local function Capture(ply, t, rec)
@@ -685,6 +762,28 @@ if SERVER then
         elseif not silent then
             Say(ply, "Запись слишком короткая, не сохранена.")
         end
+
+        -- Сбор данных помеченных пропов для текущего тика сцены: модель, скин,
+        -- позиция и углы каждого пропа пишутся пока шла запись (rec.start .. now).
+        local d = Dir(ply)
+        local removed = 0
+        for i = #d.props, 1, -1 do
+            local pr = d.props[i]
+            local ent = Entity(pr.index or -1)
+            if not IsValid(ent) then
+                table.remove(d.props, i)
+                removed = removed + 1
+            else
+                pr.model = ent:GetModel() or pr.model
+                pr.skin  = ent:GetSkin() or 0
+                CapturePropFrames(pr, math.max(0, CurTime() - rec.start))
+                pr.duration = pr.frames[#pr.frames] and pr.frames[#pr.frames].t or 0
+            end
+        end
+        if removed > 0 and not silent then
+            Say(ply, "Пропов удалено из сцены (не найдены): " .. removed)
+        end
+        SendPropList(ply)
         SendSync(ply)
     end
 
@@ -704,6 +803,20 @@ if SERVER then
                 elseif t >= rec.nextT then
                     rec.frames[#rec.frames + 1] = Capture(ply, t, rec)
                     rec.nextT = (interval > 0) and (t + interval) or 0
+
+                    -- Пропы сцены: на каждом тике записи сохраняем их модель, скин,
+                    -- позицию и углы для текущего тика сцены (сэмпл не чаще TICK_SAMPLE)
+                    local d = Dir(ply)
+                    for i = #d.props, 1, -1 do
+                        local pr = d.props[i]
+                        if not IsValid(Entity(pr.index or -1)) then
+                            table.remove(d.props, i)
+                        elseif (pr.nextSample or 0) <= t then
+                            if CapturePropFrames(pr, t) then
+                                pr.nextSample = t + TICK_SAMPLE
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -1509,6 +1622,7 @@ if SERVER then
             ownerPaused[ply] = false
             return
         end
+        PausePropScene(ply, paused)
         local now = CurTime()
         ownerPaused[ply] = paused and true or false
         for ent, pb in pairs(playbacks) do
@@ -1590,6 +1704,7 @@ if SERVER then
     end
 
     local function SeekOwner(ply, requestedTime)
+        SeekPropScene(ply, requestedTime)
         requestedTime = math.Clamp(tonumber(requestedTime) or 0, 0, 3600)
         for _, pb in pairs(playbacks) do
             if pb.owner == ply and IsValid(pb.ent) then
@@ -1608,6 +1723,10 @@ if SERVER then
                 current = math.max(current, PlaybackElapsed(pb, now))
                 paused = paused or pb.paused == true
             end
+        end
+        local dp = Dir(ply)
+        for _, pr in ipairs(dp.props) do
+            if propPlaybacks[pr] then maximum = math.max(maximum, pr.duration or 0) end
         end
         return current, maximum, paused
     end
@@ -1644,6 +1763,7 @@ if SERVER then
                                 local last = frames[n]
                                 for k = pb.i + 1, n do QueueFrameEvents(pb, frames[k], now) end
                                 Apply(pb, last, last, 0)
+                                SyncPropScene(pb.owner, frames[n].t)
                                 StopPlayback(ent)
                             end
                         else
@@ -1659,6 +1779,7 @@ if SERVER then
                             local span = b.t - a.t
                             local frac = span > 0 and math.Clamp((el - a.t) / span, 0, 1) or 0
                             Apply(pb, a, b, frac)
+                            SyncPropScene(pb.owner, el) -- пропы едут синхронно с таймлайном NPC
                         end
                     end
                 end
@@ -1678,6 +1799,482 @@ if SERVER then
             local pb = IsValid(o) and playbacks[o]
             if pb and pb.active and CurTime() < (pb.nadeGuardUntil or 0) then e:Remove() end
         end)
+    end)
+
+    ------------------------------------------------------------------
+    -- ПРОПЫ: реестр, запись движения, воспроизведение по таймлайну сцены
+    ------------------------------------------------------------------
+    -- Структура пропа в сцене (d.props[i]):
+    --   {
+    --     pid      = уникальный id пропа в сцене,
+    --     index    = EntIndex оригинального пропа (по нему спавним дубль при воспроизведении),
+    --     model    = путь модели, skin = скин,
+    --     pos, ang = позиция/углы на момент добавления (точка отсчёта оффсета),
+    --     delay    = личная задержка старта, сек,
+    --     frames   = { {t, x, y, z, p, yaw, r}, ... } — движение, записанное пока шла запись трека,
+    --     duration = t последнего кадра,
+    --   }
+    -- Воспроизведение (propPlaybacks[pr]):
+    --   { ent, offset, start, paused, pausedElapsed, i }
+
+    -- Спрятать оригинальный проп на время сцены (виден только его движущийся дубль)
+    local function HideOriginalProp(pr)
+        local orig = Entity(pr.index or -1)
+        if IsValid(orig) then
+            orig:SetNoDraw(true)
+            orig:DrawShadow(false)
+            orig:SetNotSolid(true)
+            orig.MyRecHiddenProp = true
+        end
+    end
+
+    local function RestoreOriginalProp(pr)
+        local orig = Entity(pr.index or -1)
+        if IsValid(orig) and orig.MyRecHiddenProp then
+            orig:SetNoDraw(false)
+            orig:DrawShadow(true)
+            orig:SetNotSolid(false)
+            orig.MyRecHiddenProp = nil
+        end
+    end
+
+    local function MarkProp(ply)
+        local d = Dir(ply)
+        local tr = ply:GetEyeTrace()
+        local ent = tr.Entity
+
+        if not IsValid(ent) or ent:IsPlayer() or ent:IsNPC() or ent:GetClass() == "prop_ragdoll" then
+            Say(ply, "Наведи прицел на предмет (prop) и повтори.")
+            return
+        end
+
+        ent.IsMarkedForRecording = true -- флаг «проп помечен для записи»
+
+        for _, pr in ipairs(d.props) do
+            if pr.index == ent:EntIndex() then
+                Say(ply, "Этот проп уже в списке сцены.")
+                return
+            end
+        end
+
+        if #d.props >= MAX_PROPS then
+            Say(ply, "Достигнут лимит пропов (" .. MAX_PROPS .. ").")
+            return
+        end
+
+        local pid = d.nextPid
+        d.nextPid = pid + 1
+        d.props[#d.props + 1] = {
+            pid     = pid,
+            index   = ent:EntIndex(),
+            model   = ent:GetModel() or "",
+            skin    = ent:GetSkin() or 0,
+            pos     = ent:GetPos(),
+            ang     = ent:GetAngles(),
+            delay   = 0,
+            frames  = {},
+            duration = 0,
+        }
+        Say(ply, ("Проп #%d добавлен в сцену: %s")
+            :format(pid, string.Split(ent:GetModel(), "/")[#string.Split(ent:GetModel(), "/")] or ent:GetClass()))
+        SendPropList(ply)
+    end
+
+    local function RemoveProp(ply, pid)
+        local d = Dir(ply)
+        for i, pr in ipairs(d.props) do
+            if pr.pid == pid then
+                StopPropPlayback(pr)
+                RestoreOriginalProp(pr)
+                table.remove(d.props, i)
+                SendPropList(ply)
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Остановить воспроизведение одного пропа: удаляем дубль, возвращаем оригинал
+    StopPropPlayback = function(pr, nosync)
+        local pp = propPlaybacks[pr]
+        if not pp then return end
+        propPlaybacks[pr] = nil
+        if IsValid(pp.ent) then pp.ent:Remove() end
+        RestoreOriginalProp(pr)
+        if not nosync then MarkSceneDirty(pp.owner) end
+    end
+
+    -- Полная остановка всех пропов игрока
+    StopAllProps = function(ply)
+        local d = Dir(ply)
+        for _, pr in ipairs(d.props) do
+            StopPropPlayback(pr, true)
+        end
+    end
+
+    -- Старт сцены для одного пропа: спавн дубля, физика/коллизия выключены
+    local function StartPropPlayback(ply, pr, sceneT)
+        if propPlaybacks[pr] then StopPropPlayback(pr, true) end
+        if #pr.frames == 0 then return false end
+
+        local ent = ents.Create("prop_dynamic")
+        if not IsValid(ent) then return false end
+
+        ent:SetModel(pr.model)
+        ent:SetSkin(pr.skin or 0)
+        ent:Spawn()
+        ent:Activate()
+
+        -- отключаем физику и коллизию; двигаем по координатам вручную
+        ent:SetNotSolid(true)
+        ent:SetMoveType(MOVETYPE_NONE)
+        ent:SetCollisionGroup(COLLISION_GROUP_WORLD)
+        ent:PhysicsDestroy()
+
+        local first = pr.frames[1]
+        local fpos  = Vector(first.x, first.y, first.z)
+        ent:SetPos(fpos)
+        ent:SetAngles(Angle(first.p, first.yaw, first.r))
+
+        -- оффсет: проп повторяет записанное движение относительно своей текущей позиции
+        local cur = Entity(pr.index or -1)
+        local basePos, baseAng = pr.pos or fpos, pr.ang or Angle(first.p, first.yaw, first.r)
+        if IsValid(cur) then
+            basePos, baseAng = cur:GetPos(), cur:GetAngles()
+            HideOriginalProp(pr)
+        end
+
+        local elapsed = math.max(0, (sceneT or 0) - (pr.delay or 0))
+        propPlaybacks[pr] = {
+            ent    = ent,
+            owner  = ply,
+            offset = basePos - fpos,
+            offAng = baseAng - Angle(first.p, first.yaw, first.r),
+            start  = CurTime() - elapsed,
+            paused = false,
+            i      = 1,
+        }
+        return true
+    end
+
+    -- «ЗАПУСТИТЬ ВСЕХ»: пропы стартуют вместе со сценой NPC
+    local function PlayAllProps(ply)
+        local d = Dir(ply)
+        local started = 0
+        for _, pr in ipairs(d.props) do
+            if StartPropPlayback(ply, pr, 0) then started = started + 1 end
+        end
+        return started
+    end
+
+    -- Двигать пропы синхронно с таймлайном NPC (вызывается из MyRec_Playback)
+    SyncPropScene = function(ply, sceneT)
+        local d = Dir(ply)
+        for _, pr in ipairs(d.props) do
+            local pp = propPlaybacks[pr]
+            if pp and not pp.paused then
+                local f = pr.frames
+                local n = #f
+                local el = math.Clamp(sceneT - (pr.delay or 0), 0, pr.duration or 0)
+                local i = 1
+                while i < n - 1 and f[i + 1].t <= el do i = i + 1 end
+                pp.i = i
+                local a, b = f[i], f[math.min(i + 1, n)]
+                local span = (b.t or 0) - (a.t or 0)
+                local frac = span > 0 and math.Clamp((el - (a.t or 0)) / span, 0, 1) or 0
+                if IsValid(pp.ent) then
+                    pp.ent:SetPos(LerpVector(frac, Vector(a.x, a.y, a.z), Vector(b.x, b.y, b.z)) + pp.offset)
+                    pp.ent:SetAngles(LerpAngle(frac, Angle(a.p, a.yaw, a.r), Angle(b.p, b.yaw, b.r)) + pp.offAng)
+                end
+            end
+        end
+    end
+
+    PausePropScene = function(ply, paused)
+        local now = CurTime()
+        local d = Dir(ply)
+        for _, pr in ipairs(d.props) do
+            local pp = propPlaybacks[pr]
+            if pp then
+                if paused and not pp.paused then
+                    pp.paused = true
+                    pp.pausedElapsed = math.max(0, now - pp.start)
+                elseif not paused and pp.paused then
+                    pp.paused = false
+                    pp.start = now - (pp.pausedElapsed or 0)
+                end
+            end
+        end
+    end
+
+    SeekPropScene = function(ply, requestedTime)
+        local d = Dir(ply)
+        for _, pr in ipairs(d.props) do
+            local pp = propPlaybacks[pr]
+            if pp then
+                local el = math.max(0, tonumber(requestedTime) or 0)
+                pp.start = CurTime() - el
+                if pp.paused then pp.pausedElapsed = el end
+            end
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- СОХРАНЕНИЯ (JSON) И АВТОСОХРАНЕНИЕ
+    ------------------------------------------------------------------
+    -- Остановить всех NPC и пропы режиссёра (нужно перед загрузкой сцены;
+    -- функция определена ниже, ссылка сохраняется через upvalue)
+    local function StopAll(ply)
+        for ent, pb in pairs(playbacks) do
+            if pb.owner == ply then StopPlayback(ent, true, true) end
+        end
+        StopAllProps(ply)
+        ownerPaused[ply] = false
+        MarkSceneDirty(ply)
+        SendSync(ply)
+    end
+
+    -- Сериализация кадра NPC: Vector/Angle переводим в числа — JSON их не знает.
+    local function SerializeFrame(f)
+        return {
+            t = f.t, crouch = f.crouch and true or false,
+            weapon = f.weapon or "",
+            attack = f.attack and true or false,
+            click  = f.click and true or false,
+            release = f.release and true or false,
+            aim    = f.aim and true or false,
+            reload = f.reload and true or false,
+            AmmoFired = f.AmmoFired or 0,
+            shots  = f.shots,
+            px = f.pos.x, py = f.pos.y, pz = f.pos.z,
+            ap = f.ang.p, ay = f.ang.y, ar = f.ang.r,
+            pose = f.pose or {},
+        }
+    end
+
+    local function DeserializeFrame(fr)
+        return {
+            t = tonumber(fr.t) or 0,
+            pos = Vector(tonumber(fr.px) or 0, tonumber(fr.py) or 0, tonumber(fr.pz) or 0),
+            ang = Angle(tonumber(fr.ap) or 0, tonumber(fr.ay) or 0, tonumber(fr.ar) or 0),
+            crouch = fr.crouch == true,
+            weapon = fr.weapon or "",
+            attack = fr.attack == true,
+            click  = fr.click == true,
+            release = fr.release == true,
+            aim    = fr.aim == true,
+            reload = fr.reload == true,
+            AmmoFired = tonumber(fr.AmmoFired) or 0,
+            shots = tonumber(fr.shots),
+            pose = fr.pose or {},
+        }
+    end
+
+    -- Кадр пропа уже хранится числами ({t,x,y,z,p,yaw,r}) — чистим только nil-поля
+    local function SerializePropFrame(f)
+        return { t = f.t, x = f.x, y = f.y, z = f.z, p = f.p, yaw = f.yaw, r = f.r }
+    end
+
+    -- SafeWriteFile не создаёт вложенные папки — убедимся, что data/gmod_animator существует
+    local function EnsureSceneDir()
+        if not file.Exists(SCENE_DIR, "DATA") then
+            file.CreateDir(SCENE_DIR)
+        end
+    end
+
+    -- Переводит ВСЮ глобальную таблицу текущей сцены (треки + группы + привязки + пропы)
+    -- в JSON и сохраняет в game/data/gmod_animator/<filename>.txt
+    SaveScene = function(ply, filename, silent)
+        if not IsValid(ply) then return false end
+        local d = Dir(ply)
+
+        local scene = {
+            version   = 1,
+            saved     = os.time(),
+            nextGroup = d.nextGroup,
+            nextBid   = d.nextBid,
+            nextPid   = d.nextPid,
+
+            tracks = {},
+            for _, t in ipairs(d.tracks) do
+                local frames = {}
+                for i, f in ipairs(t.frames or {}) do frames[i] = SerializeFrame(f) end
+                scene.tracks[#scene.tracks + 1] = {
+                    name = t.name, weapon = t.weapon or "", model = t.model or "",
+                    duration = t.duration or 0, ammoFired = t.ammoFired or 0,
+                    autoClass = t.autoClass or {},
+                    hasClick = t.hasClick == true, hasShots = t.hasShots == true,
+                    frames = frames,
+                }
+            end,
+
+            groups = {},
+            for _, g in ipairs(d.groups) do
+                scene.groups[#scene.groups + 1] = { id = g.id, name = g.name, delay = g.delay or 0 }
+            end,
+
+            bindings = {},
+            for _, b in ipairs(d.bindings) do
+                local m = b.manifest or {}
+                scene.bindings[#scene.bindings + 1] = {
+                    bid = b.bid, track = b.track, group = b.group, delay = b.delay or 0,
+                    played = b.played == true,
+                    manifest = {
+                        class = m.class or "npc_citizen", model = m.model or "",
+                        pos = { x = m.pos and m.pos.x or 0, y = m.pos and m.pos.y or 0, z = m.pos and m.pos.z or 0 },
+                        ang = { p = m.ang and m.ang.p or 0, y = m.ang and m.ang.y or 0, r = m.ang and m.ang.r or 0 },
+                        skin = m.skin or 0, spawnflags = m.spawnflags or 0,
+                        health = m.health or 0, weapon = m.weapon or "",
+                        bodygroups = m.bodygroups or {},
+                    },
+                }
+            end,
+
+            -- Пропы: модель, скин, позиция/углы базы, задержка и кадры движения
+            props = {},
+            for _, pr in ipairs(d.props) do
+                local frames = {}
+                for i, f in ipairs(pr.frames or {}) do frames[i] = SerializePropFrame(f) end
+                scene.props[#scene.props + 1] = {
+                    pid = pr.pid, index = pr.index or 0,
+                    model = pr.model or "", skin = pr.skin or 0,
+                    pos = { x = pr.pos and pr.pos.x or 0, y = pr.pos and pr.pos.y or 0, z = pr.pos and pr.pos.z or 0 },
+                    ang = { p = pr.ang and pr.ang.p or 0, y = pr.ang and pr.ang.y or 0, r = pr.ang and pr.ang.r or 0 },
+                    delay = pr.delay or 0, duration = pr.duration or 0,
+                    frames = frames,
+                }
+            end,
+        }
+
+        EnsureSceneDir()
+        local ok = file.Write(SCENE_DIR .. "/" .. filename, util.TableToJSON(scene, true))
+        if not silent then
+            Say(ply, ok and ("Сцена сохранена: data/" .. SCENE_DIR .. "/" .. filename)
+                          or "Не удалось записать файл сохранения.")
+        end
+        return ok ~= false
+    end
+
+    -- Загрузка сцены из JSON. Живые NPC/пропы оригинального уровня по EntIndex
+    -- после перезагрузки карты не находятся — привязки и пропы помечаются как
+    -- «ждущие возрождения»: NPC восстановится кнопкой «Возобновить сценарий»,
+    -- пропы отрисуются дублями prop_dynamic при запуске сцены.
+    local function LoadScene(ply, filename)
+        if not IsValid(ply) then return false end
+
+        local raw = file.Read(SCENE_DIR .. "/" .. filename, "DATA")
+        if not raw or raw == "" then
+            Say(ply, "Файл не найден: data/" .. SCENE_DIR .. "/" .. filename)
+            return false
+        end
+
+        local scene = util.JSONToTable(raw)
+        if type(scene) ~= "table" or type(scene.tracks) ~= "table" then
+            Say(ply, "Файл повреждён или не является сценой MyRec.")
+            return false
+        end
+
+        StopAll(ply) -- остановить текущее воспроизведение до замены сцены
+
+        local d = Dir(ply)
+        d.tracks, d.groups, d.bindings, d.props = {}, {}, {}, {}
+        d.nextGroup, d.nextBid, d.nextPid = 2, 1, 1
+
+        for _, t in ipairs(scene.tracks) do
+            local frames = {}
+            for i, fr in ipairs(t.frames or {}) do frames[i] = DeserializeFrame(fr) end
+            if #frames >= 2 then
+                d.tracks[#d.tracks + 1] = {
+                    name = tostring(t.name or ("track_" .. #d.tracks + 1)),
+                    frames = frames,
+                    weapon = t.weapon or "",
+                    model  = t.model or "",
+                    duration = tonumber(t.duration) or frames[#frames].t or 0,
+                    ammoFired = tonumber(t.ammoFired) or 0,
+                    autoClass = t.autoClass or {},
+                    hasClick = t.hasClick == true,
+                    hasShots = t.hasShots == true,
+                }
+            end
+        end
+
+        for _, g in ipairs(scene.groups or {}) do
+            local id = tonumber(g.id) or 0
+            d.groups[#d.groups + 1] = { id = id, name = tostring(g.name or ("Группа " .. id)), delay = tonumber(g.delay) or 0 }
+            if id >= d.nextGroup then d.nextGroup = id + 1 end
+        end
+        if #d.groups == 0 then d.groups[1] = { id = 1, name = "Группа 1", delay = 0 } end
+
+        for _, b in ipairs(scene.bindings or {}) do
+            local m = b.manifest or {}
+            local bid = tonumber(b.bid) or d.nextBid
+            local ent = Entity(0) -- placeholder: оригинальный NPC не найден, ждёт «Возобновить сценарий»
+            if bid >= d.nextBid then d.nextBid = bid + 1 end
+            d.bindings[#d.bindings + 1] = {
+                bid = bid, ent = ent,
+                track = tostring(b.track or ""), group = tonumber(b.group) or (d.groups[1].id),
+                delay = tonumber(b.delay) or 0, played = b.played == true,
+                manifest = {
+                    class = m.class or "npc_citizen", model = m.model or "",
+                    pos = Vector((m.pos or {}).x or 0, (m.pos or {}).y or 0, (m.pos or {}).z or 0),
+                    ang = Angle((m.ang or {}).p or 0, (m.ang or {}).y or 0, (m.ang or {}).r or 0),
+                    skin = m.skin or 0, spawnflags = m.spawnflags or 0,
+                    health = m.health or 0, weapon = m.weapon or "",
+                    bodygroups = m.bodygroups or {},
+                },
+            }
+        end
+
+        for _, pr in ipairs(scene.props or {}) do
+            local pid = tonumber(pr.pid) or d.nextPid
+            if pid >= d.nextPid then d.nextPid = pid + 1 end
+            local frames = {}
+            for i, f in ipairs(pr.frames or {}) do
+                frames[i] = {
+                    t = tonumber(f.t) or 0,
+                    x = tonumber(f.x) or 0, y = tonumber(f.y) or 0, z = tonumber(f.z) or 0,
+                    p = tonumber(f.p) or 0, yaw = tonumber(f.yaw) or 0, r = tonumber(f.r) or 0,
+                }
+            end
+            d.props[#d.props + 1] = {
+                pid = pid, index = tonumber(pr.index) or 0,
+                model = pr.model or "", skin = tonumber(pr.skin) or 0,
+                pos = Vector((pr.pos or {}).x or 0, (pr.pos or {}).y or 0, (pr.pos or {}).z or 0),
+                ang = Angle((pr.ang or {}).p or 0, (pr.ang or {}).y or 0, (pr.ang or {}).r or 0),
+                delay = tonumber(pr.delay) or 0,
+                frames = frames,
+                duration = tonumber(pr.duration) or (frames[#frames] and frames[#frames].t or 0),
+            }
+        end
+
+        SendSync(ply)
+        SendPropList(ply)
+        Say(ply, ("Сцена «%s» загружена: треков %d, групп %d, привязок %d, пропов %d. NPC можно возродить кнопкой «Возобновить сценарий».")
+            :format(filename, #d.tracks, #d.groups, #d.bindings, #d.props))
+        return true
+    end
+
+    -- «Грязная» сцена: трогали объекты с прошлого автосейва — есть что сохранять
+    local sceneDirty = {} -- [ply] = true
+    MarkSceneDirty = function(ply)
+        if IsValid(ply) then sceneDirty[ply] = true end
+    end
+
+    -- Автосохранение КАЖДУЮ МИНУТУ во время активной работы/редактирования сцены
+    timer.Create("MyRec_Autosave", 60, 0, function()
+        for ply, d in pairs(director) do
+            if IsValid(ply) then
+                local active = recording[ply] or IsPlaying(ply) or sceneDirty[ply]
+                local hasData = #d.tracks > 0 or #d.props > 0 or #d.bindings > 0
+                if active and hasData then
+                    SaveScene(ply, AUTOSAVE, true) -- перезаписывает autosave.txt молча
+                    sceneDirty[ply] = nil
+                end
+            else
+                director[ply] = nil
+                sceneDirty[ply] = nil
+            end
+        end
     end)
 
     local function BindTrack(ply, trackName, groupId)
@@ -1787,10 +2384,13 @@ if SERVER then
             end
         end
 
-        if count == 0 and dead == 0 then
+        local propsStarted = PlayAllProps(ply) -- пропы стартуют синхронно со сценой NPC
+        MarkSceneDirty(ply)
+
+        if count == 0 and dead == 0 and propsStarted == 0 then
             Say(ply, "Нет привязанных NPC. Привяжи треки к NPC.")
         else
-            local msg = "Запущено объектов: " .. count
+            local msg = "Запущено объектов: " .. count .. (propsStarted > 0 and (" + пропов: " .. propsStarted) or "")
             if dead > 0 then msg = msg .. (" (убитых: %d — нажми «Возобновить сценарий»)"):format(dead) end
             Say(ply, msg)
         end
@@ -1885,14 +2485,6 @@ if SERVER then
         timer.Simple(0, function() ResyncOwnersOf(ent) end)
     end)
 
-    local function StopAll(ply)
-        for ent, pb in pairs(playbacks) do
-            if pb.owner == ply then StopPlayback(ent, true, true) end
-        end
-        ownerPaused[ply] = false
-        SendSync(ply)
-    end
-
     net.Receive(NET_CMD, function(_, ply)
         if not CanUse(ply) then return end
         local cmd = net.ReadUInt(4)
@@ -1957,6 +2549,7 @@ if SERVER then
                     break
                 end
             end
+            MarkSceneDirty(ply)
             SendSync(ply)
         elseif cmd == CMD.SET_NPC_DELAY then
             local bid   = net.ReadUInt(16)
@@ -1982,6 +2575,37 @@ if SERVER then
             SetOwnerPaused(ply, not (ownerPaused[ply] == true))
         elseif cmd == CMD.SEEK then
             SeekOwner(ply, net.ReadFloat())
+        elseif cmd == CMD.PROP_MARK then
+            MarkProp(ply)
+            MarkSceneDirty(ply)
+        elseif cmd == CMD.PROP_DEL then
+            local pid = net.ReadUInt(16)
+            if RemoveProp(ply, pid) then MarkSceneDirty(ply) end
+        elseif cmd == CMD.SAVE then
+            local name = CleanFileName(net.ReadString())
+            if name == "" then
+                Say(ply, "Введи имя файла сохранения (латиница/цифры, без пробелов).")
+            else
+                SaveScene(ply, name)
+                sceneDirty[ply] = nil -- сохранено вручную — автосейв можно пропустить
+            end
+        elseif cmd == CMD.LOAD then
+            LoadScene(ply, CleanFileName(net.ReadString()))
+        end
+    end)
+
+    concommand.Add("my_rec_save", function(ply, _, args)
+        if not CanUse(ply) then return end
+        SaveScene(ply, CleanFileName(args[1] or "") ~= "" and CleanFileName(args[1]) or AUTOSAVE)
+    end)
+
+    concommand.Add("my_rec_load", function(ply, _, args)
+        if not CanUse(ply) then return end
+        local name = CleanFileName(args[1] or "")
+        if name == "" then
+            Say(ply, "Использование: my_rec_load <имя_файла>.txt")
+        else
+            LoadScene(ply, name)
         end
     end)
 
